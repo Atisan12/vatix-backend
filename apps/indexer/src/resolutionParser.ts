@@ -243,18 +243,17 @@ export interface ParseResolutionEventOptions {
  * Parse a single RawChainEvent into a NormalizedResolution.
  *
  * @throws ResolutionParseError if the event is not a resolution event, the
- *   payload is malformed, or (in production) the payload uses a legacy
- *   dev-stub shape instead of the canonical on-chain layout.
+ *   payload is malformed, or (in production) the payload uses a legacy shape.
  */
 export function parseResolutionEvent(
   event: RawChainEvent,
-  options?: ParseResolutionEventOptions
+  options: ParseResolutionEventOptions = {}
 ): NormalizedResolution {
-  const nodeEnv = options?.nodeEnv ?? process.env.NODE_ENV ?? "development";
+  const nodeEnv = options.nodeEnv ?? process.env.NODE_ENV ?? "development";
 
-  if (!isResolutionEvent(event.topicsXdr)) {
+  if (!isResolutionEvent(event.topics)) {
     throw new ResolutionParseError(
-      `Event topic is not "${RESOLUTION_EVENT_TOPIC}"`,
+      `Event is not a ${RESOLUTION_EVENT_TOPIC} event`,
       event.id,
       undefined,
       ResolutionErrorCode.WRONG_TOPIC
@@ -263,7 +262,7 @@ export function parseResolutionEvent(
 
   let decoded: unknown;
   try {
-    decoded = decodeScVal(event.valueXdr);
+    decoded = decodeScVal(event.value);
   } catch (err) {
     throw new ResolutionParseError(
       "Failed to decode event value XDR",
@@ -273,26 +272,17 @@ export function parseResolutionEvent(
     );
   }
 
-  let payload: ResolutionPayload;
-  try {
-    payload = parseResolutionPayload(decoded, event.topicsXdr, event.id, nodeEnv);
-  } catch (err) {
-    if (isProductionEnv(nodeEnv)) {
-      options?.telemetry?.record("indexer.parser.legacy_shape_rejected", 1, {
-        parser: "resolution",
-        eventId: event.id,
-        contractId: event.contractId,
-        ledger: String(event.ledger),
-      });
-    }
-    throw err;
-  }
+  const payload = parseResolutionPayload(
+    decoded,
+    event.topics,
+    event.id,
+    nodeEnv
+  );
 
   return {
     eventId: event.id,
     ledger: event.ledger,
-    ledgerClosedAt: event.ledgerClosedAt,
-    contractId: event.contractId,
+    txHash: event.txHash,
     marketId: payload.marketId,
     outcome: payload.outcome,
     oracleAddress: payload.oracleAddress,
@@ -301,44 +291,28 @@ export function parseResolutionEvent(
 }
 
 /**
- * Parse a batch of raw events, skipping non-resolution events silently.
- * Errors are collected per-event so one bad payload never drops the batch.
+ * Parse a batch of RawChainEvents, skipping non-resolution events and
+ * collecting per-event parse failures so a single malformed event cannot
+ * halt ingestion of the rest of the batch.
  */
 export function parseResolutionEvents(
   events: RawChainEvent[],
-  options?: ParseResolutionEventOptions
-): {
-  resolutions: NormalizedResolution[];
-  errors: ResolutionParseError[];
-} {
+  options: ParseResolutionEventOptions = {}
+): { resolutions: NormalizedResolution[]; errors: ResolutionParseError[] } {
   const resolutions: NormalizedResolution[] = [];
   const errors: ResolutionParseError[] = [];
-  const telemetry = options?.telemetry;
-  const nodeEnv = options?.nodeEnv ?? process.env.NODE_ENV ?? "development";
 
   for (const event of events) {
-    if (!isResolutionEvent(event.topicsXdr)) {
-      telemetry?.record("indexer.parser.unknown_topics", 1, {
-        parser: "resolution",
-        eventId: event.id,
-        contractId: event.contractId,
-        ledger: String(event.ledger),
-      });
-      continue;
-    }
+    if (!isResolutionEvent(event.topics)) continue;
     try {
-      resolutions.push(parseResolutionEvent(event, { telemetry, nodeEnv }));
+      resolutions.push(parseResolutionEvent(event, options));
     } catch (err) {
-      errors.push(
-        err instanceof ResolutionParseError
-          ? err
-          : new ResolutionParseError(
-              String(err),
-              event.id,
-              err,
-              ResolutionErrorCode.BAD_VALUE_XDR
-            )
-      );
+      if (err instanceof ResolutionParseError) {
+        errors.push(err);
+        options.telemetry?.recordResolutionParseError?.(err);
+      } else {
+        throw err;
+      }
     }
   }
 
