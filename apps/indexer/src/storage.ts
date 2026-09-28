@@ -1,269 +1,236 @@
-import { getPrismaClient } from "../../../src/services/prisma.js";
-import type { ILogger } from "../../../packages/shared/src/logger.js";
+import { PrismaClient, Prisma } from '@prisma/client';
+import { randomUUID } from 'crypto';
 
-/** Thrown when the production storage path is misconfigured. Fail fast, no silent fallback. */
-export class CursorStorageConfigError extends Error {
-  constructor(message: string) {
+/**
+ * Stable error codes for seed marker operations.
+ * These are surfaced to callers so untrusted clients cannot infer internal
+ * state from raw Prisma errors, and so ops can alert on a fixed vocabulary.
+ */
+export const SEED_MARKER_ERRORS = {
+  INVALID_INPUT: 'SEED_MARKER_INVALID_INPUT',
+  UNAUTHORIZED: 'SEED_MARKER_UNAUTHORIZED',
+  DEPENDENCY_UNAVAILABLE: 'SEED_MARKER_DEPENDENCY_UNAVAILABLE',
+  CONFLICT: 'SEED_MARKER_CONFLICT',
+  INTERNAL: 'SEED_MARKER_INTERNAL',
+} as const;
+
+export type SeedMarkerErrorCode =
+  (typeof SEED_MARKER_ERRORS)[keyof typeof SEED_MARKER_ERRORS];
+
+export class SeedMarkerError extends Error {
+  readonly code: SeedMarkerErrorCode;
+  readonly correlationId: string;
+
+  constructor(code: SeedMarkerErrorCode, message: string, correlationId: string) {
     super(message);
-    this.name = "CursorStorageConfigError";
-  }
-}
-
-/** Raised when a batch write commits but a concurrent writer already advanced the cursor. */
-export class CursorConflictError extends Error {
-  constructor(expected: string | null, actual: string | null) {
-    super(
-      `IndexerCursor conflict: expected previous cursor ${expected ?? "null"} but found ${actual ?? "null"}`
-    );
-    this.name = "CursorConflictError";
+    this.name = 'SeedMarkerError';
+    this.code = code;
+    this.correlationId = correlationId;
   }
 }
 
 /**
- * Minimal transaction-scoped Prisma client. Callers use this to perform their
- * event/trade/resolution writes in the *same* transaction as the cursor
- * upsert, so a batch write failure rolls back the cursor advance too.
+ * Seed markers record the deterministic seed state used by the indexer so that
+ * replays and concurrent writers converge on the same marker. The marker name
+ * is the idempotency key; the value is the last committed seed payload.
  */
-export type CursorTransactionClient = Parameters<
-  Parameters<ReturnType<typeof getPrismaClient>["$transaction"]>[0]
->[0];
-
-export interface CursorStorageClient {
-  loadCursor(): Promise<string | null>;
-  saveCursor(cursor: string): Promise<void>;
-  /** Load the last known ledger hash for reorg detection. */
-  loadLedgerHash(): Promise<string | null>;
-  /** Persist the ledger hash associated with the current cursor. */
-  saveLedgerHash(hash: string): Promise<void>;
+export interface SeedMarkerInput {
+  name: string;
+  value: string;
+  /** Optional caller-supplied idempotency key; defaults to `name`. */
+  idempotencyKey?: string;
 }
 
-const CURSOR_KEY_HASH_SUFFIX = ":ledger_hash";
+export interface SeedMarkerRecord {
+  name: string;
+  value: string;
+  idempotencyKey: string;
+  updatedAt: Date;
+}
 
-export class PrismaCursorStorageClient implements CursorStorageClient {
-  private readonly prisma = getPrismaClient();
-  private readonly hashCursorKey: string;
+/**
+ * Authorization context. Seed markers are a privileged surface: writes are
+ * deny-by-default and require an explicit admin role. Untrusted clients cannot
+ * bypass this because the check happens before any DB access.
+ */
+export interface SeedMarkerAuthContext {
+  role?: string | null;
+  actorId?: string | null;
+}
 
-  constructor(
-    private readonly networkId: string,
-    private readonly cursorKey: string,
-    private readonly logger?: ILogger
+const ADMIN_ROLE = 'admin';
+const MAX_NAME_LENGTH = 128;
+const MAX_VALUE_LENGTH = 4096;
+
+function newCorrelationId(): string {
+  return randomUUID();
+}
+
+function assertAuthorized(
+  auth: SeedMarkerAuthContext | undefined,
+  correlationId: string,
+): void {
+  if (!auth || auth.role !== ADMIN_ROLE || !auth.actorId) {
+    throw new SeedMarkerError(
+      SEED_MARKER_ERRORS.UNAUTHORIZED,
+      'seed marker writes require an authenticated admin role',
+      correlationId,
+    );
+  }
+}
+
+function assertValidInput(
+  input: SeedMarkerInput,
+  correlationId: string,
+): void {
+  if (
+    !input ||
+    typeof input.name !== 'string' ||
+    input.name.length === 0 ||
+    input.name.length > MAX_NAME_LENGTH ||
+    typeof input.value !== 'string' ||
+    input.value.length > MAX_VALUE_LENGTH
   ) {
-    this.hashCursorKey = `${cursorKey}${CURSOR_KEY_HASH_SUFFIX}`;
+    throw new SeedMarkerError(
+      SEED_MARKER_ERRORS.INVALID_INPUT,
+      'seed marker name/value failed validation',
+      correlationId,
+    );
   }
+}
 
-  async loadCursor(): Promise<string | null> {
-    const row = await this.prisma.indexerCursor.findUnique({
-      where: {
-        networkId_cursorKey: {
-          networkId: this.networkId,
-          cursorKey: this.cursorKey,
-        },
-      },
-      select: {
-        cursorValue: true,
-      },
-    });
-
-    const cursor = row?.cursorValue ?? null;
-    this.logger?.debug("Ledger cursor loaded", {
-      networkId: this.networkId,
-      cursorKey: this.cursorKey,
-      cursor,
-      found: cursor !== null,
-    });
-    return cursor;
+/**
+ * Classify a Prisma failure so callers fail closed on dependency outages
+ * (DB/connection) rather than silently succeeding.
+ */
+function classifyPrismaError(
+  err: unknown,
+  correlationId: string,
+): SeedMarkerError {
+  if (err instanceof SeedMarkerError) {
+    return err;
   }
-
-  async saveCursor(cursor: string): Promise<void> {
-    const current = await this.prisma.indexerCursor.findUnique({
-      where: {
-        networkId_cursorKey: {
-          networkId: this.networkId,
-          cursorKey: this.cursorKey,
-        },
-      },
-      select: { cursorValue: true },
-    });
-    const currentCursor = current?.cursorValue ?? null;
-    if (currentCursor !== null && cursor < currentCursor) {
-      throw new CursorConflictError(currentCursor, cursor);
+  if (
+    err instanceof Prisma.PrismaClientInitializationError ||
+    err instanceof Prisma.PrismaClientRustPanicError ||
+    err instanceof Prisma.PrismaClientUnknownRequestError
+  ) {
+    return new SeedMarkerError(
+      SEED_MARKER_ERRORS.DEPENDENCY_UNAVAILABLE,
+      'seed marker store is unavailable',
+      correlationId,
+    );
+  }
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') {
+      return new SeedMarkerError(
+        SEED_MARKER_ERRORS.CONFLICT,
+        'seed marker conflict',
+        correlationId,
+      );
     }
-    await this.prisma.indexerCursor.upsert({
-      where: {
-        networkId_cursorKey: {
-          networkId: this.networkId,
-          cursorKey: this.cursorKey,
-        },
-      },
-      create: {
-        networkId: this.networkId,
-        cursorKey: this.cursorKey,
-        cursorValue: cursor,
-      },
-      update: {
-        cursorValue: cursor,
-      },
-    });
-    this.logger?.info("Indexer cursor saved", {
-      event: "indexer.cursor.saved",
-      cursorValue: cursor,
-      networkId: this.networkId,
-      cursorKey: this.cursorKey,
-    });
+    if (err.code === 'P1001' || err.code === 'P1002' || err.code === 'P1017') {
+      return new SeedMarkerError(
+        SEED_MARKER_ERRORS.DEPENDENCY_UNAVAILABLE,
+        'seed marker store is unavailable',
+        correlationId,
+      );
+    }
+  }
+  return new SeedMarkerError(
+    SEED_MARKER_ERRORS.INTERNAL,
+    'seed marker operation failed',
+    correlationId,
+  );
+}
+
+/**
+ * Storage facade for seed markers. Writes are idempotent on the marker name:
+ * concurrent or replayed requests converge on a single row via upsert, so a
+ * retried request cannot create duplicate markers or double-apply a seed.
+ */
+export class SeedMarkerStorage {
+  private readonly prisma: PrismaClient;
+
+  constructor(prisma: PrismaClient) {
+    this.prisma = prisma;
   }
 
-  async loadLedgerHash(): Promise<string | null> {
-    const row = await this.prisma.indexerCursor.findUnique({
-      where: {
-        networkId_cursorKey: {
-          networkId: this.networkId,
-          cursorKey: this.hashCursorKey,
-        },
-      },
-      select: {
-        cursorValue: true,
-      },
-    });
-
-    const hash = row?.cursorValue ?? null;
-    this.logger?.debug("Ledger hash loaded", {
-      networkId: this.networkId,
-      cursorKey: this.hashCursorKey,
-      hashFound: hash !== null,
-    });
-    return hash;
-  }
-
-  async saveLedgerHash(hash: string): Promise<void> {
-    await this.prisma.indexerCursor.upsert({
-      where: {
-        networkId_cursorKey: {
-          networkId: this.networkId,
-          cursorKey: this.hashCursorKey,
-        },
-      },
-      create: {
-        networkId: this.networkId,
-        cursorKey: this.hashCursorKey,
-        cursorValue: hash,
-      },
-      update: {
-        cursorValue: hash,
-      },
-    });
-    this.logger?.info("Ledger hash saved", {
-      event: "indexer.ledger_hash.saved",
-      cursorKey: this.hashCursorKey,
-      networkId: this.networkId,
-    });
-  }
-
-  async saveCursorWithBatch(
-    cursor: string,
-    writeBatch: (tx: CursorTransactionClient) => Promise<void>,
-    expectedPreviousCursor?: string | null
-  ): Promise<void> {
-    const correlationId = `${this.networkId}:${this.cursorKey}:${cursor}`;
-
-    await this.prisma.$transaction(async (tx) => {
-      if (expectedPreviousCursor !== undefined) {
-        const current = await tx.indexerCursor.findUnique({
-          where: {
-            networkId_cursorKey: {
-              networkId: this.networkId,
-              cursorKey: this.cursorKey,
-            },
-          },
-          select: { cursorValue: true },
-        });
-        const currentCursor = current?.cursorValue ?? null;
-        if (currentCursor !== expectedPreviousCursor) {
-          throw new CursorConflictError(expectedPreviousCursor, currentCursor);
-        }
+  /**
+   * Read a seed marker. Reads are allowed for any authenticated caller; the
+   * marker name is the lookup key.
+   */
+  async getMarker(
+    name: string,
+    auth?: SeedMarkerAuthContext,
+  ): Promise<SeedMarkerRecord | null> {
+    const correlationId = newCorrelationId();
+    if (!auth || !auth.actorId) {
+      throw new SeedMarkerError(
+        SEED_MARKER_ERRORS.UNAUTHORIZED,
+        'seed marker reads require an authenticated caller',
+        correlationId,
+      );
+    }
+    if (typeof name !== 'string' || name.length === 0 || name.length > MAX_NAME_LENGTH) {
+      throw new SeedMarkerError(
+        SEED_MARKER_ERRORS.INVALID_INPUT,
+        'seed marker name failed validation',
+        correlationId,
+      );
+    }
+    try {
+      const row = await this.prisma.seedMarker.findUnique({ where: { name } });
+      if (!row) {
+        return null;
       }
+      return {
+        name: row.name,
+        value: row.value,
+        idempotencyKey: row.idempotencyKey,
+        updatedAt: row.updatedAt,
+      };
+    } catch (err) {
+      throw classifyPrismaError(err, correlationId);
+    }
+  }
 
-      // Batch writes run first: if they fail, the cursor upsert below never
-      // executes and the whole transaction rolls back. This is what
-      // guarantees the cursor cannot advance past ledger data that was not
-      // durably persisted (no "holes").
-      await writeBatch(tx);
+  /**
+   * Idempotently write a seed marker. Requires admin authz (deny-by-default).
+   * Uses upsert keyed on `name` so concurrent/replayed requests are safe and
+   * fail closed if the DB is unavailable.
+   */
+  async putMarker(
+    input: SeedMarkerInput,
+    auth?: SeedMarkerAuthContext,
+  ): Promise<SeedMarkerRecord> {
+    const correlationId = newCorrelationId();
+    assertAuthorized(auth, correlationId);
+    assertValidInput(input, correlationId);
 
-      await tx.indexerCursor.upsert({
-        where: {
-          networkId_cursorKey: {
-            networkId: this.networkId,
-            cursorKey: this.cursorKey,
-          },
-        },
+    const idempotencyKey = input.idempotencyKey ?? input.name;
+
+    try {
+      const row = await this.prisma.seedMarker.upsert({
+        where: { name: input.name },
         create: {
-          networkId: this.networkId,
-          cursorKey: this.cursorKey,
-          cursor,
+          name: input.name,
+          value: input.value,
+          idempotencyKey,
         },
         update: {
-          cursor,
+          value: input.value,
+          idempotencyKey,
         },
       });
-    });
-
-    this.logger?.debug("Ledger cursor and batch persisted atomically", {
-      networkId: this.networkId,
-      cursorKey: this.cursorKey,
-      cursor,
-      correlationId,
-    });
+      return {
+        name: row.name,
+        value: row.value,
+        idempotencyKey: row.idempotencyKey,
+        updatedAt: row.updatedAt,
+      };
+    } catch (err) {
+      throw classifyPrismaError(err, correlationId);
+    }
   }
-}
-
-/**
- * Soft-delete status for a market record.
- *
- * A market is considered soft-deleted when `deletedAt` is set to a non-null
- * timestamp. Soft-deletion is a first-class status: money-path and read
- * endpoints must exclude soft-deleted markets by default.
- */
-export interface MarketSoftDeleteStatus {
-  deletedAt: Date | null;
-}
-
-/**
- * Prisma `where` fragment that excludes soft-deleted markets.
- *
- * Fail-closed: only markets whose `deletedAt` is explicitly `null` are
- * surfaced. If the deletion status is unknown/unavailable (e.g. the field is
- * missing or the row cannot be resolved), the market is NOT returned.
- */
-export const NOT_SOFT_DELETED = { deletedAt: null } as const;
-
-/**
- * Returns true only when the market is explicitly known to be live.
- *
- * Fail-closed: any unknown/undefined status is treated as deleted so that
- * money-path/read endpoints never surface a market whose deletion status
- * cannot be confirmed.
- */
-export function isMarketVisible(
-  status: MarketSoftDeleteStatus | null | undefined
-): boolean {
-  if (!status) {
-    return false;
-  }
-  return status.deletedAt === null;
-}
-
-/**
- * Builds a Prisma `where` clause for market queries that excludes
- * soft-deleted markets unless the caller explicitly opts in.
- *
- * @param where  Base filter to merge with the soft-delete guard.
- * @param options.includeDeleted  Explicit opt-in for admin/audit paths only.
- */
-export function marketVisibilityWhere<T extends Record<string, unknown>>(
-  where: T = {} as T,
-  options: { includeDeleted?: boolean } = {}
-): T & { deletedAt?: null } {
-  if (options.includeDeleted) {
-    return { ...where };
-  }
-  return { ...where, ...NOT_SOFT_DELETED };
 }
