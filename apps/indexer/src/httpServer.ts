@@ -34,6 +34,15 @@ export type BodyLimitErrorCode = "PAYLOAD_TOO_LARGE";
 export type MarketErrorCode = "UNAUTHORIZED" | "MARKET_NOT_FOUND" | "MARKET_QUERY_FAILED";
 
 /**
+ * Stable error codes for indexer lag SLO responses (#1178). Kept as a closed
+ * union so clients and dashboards can branch on exact strings rather than
+ * free-form messages.
+ */
+export type IndexerLagErrorCode =
+  | "INDEXER_LAG_SLO_BREACH"
+  | "INDEXER_LAG_UNAVAILABLE";
+
+/**
  * A single critical dependency check. `check` must resolve when the
  * dependency is reachable and reject (or throw) otherwise. It must never
  * return connection strings, credentials, or internal addresses — only a
@@ -235,6 +244,105 @@ export async function runReadinessChecks(
     }
   }
 
+  return result;
+}
+
+/**
+ * Indexer lag SLO configuration (#1178). `targetLagSeconds` is the maximum
+ * acceptable gap between the chain head and the indexer's last processed
+ * block; `maxStalenessSeconds` bounds how old the last successful sample may
+ * be before the SLO is treated as unmeasurable. Both must be > 0. Semantics
+ * match docs/metrics.md (indexer_lag_seconds gauge vs. SLO target).
+ */
+export interface IndexerLagSlo {
+  /** Maximum acceptable indexer lag, in seconds. Must be > 0. */
+  targetLagSeconds: number;
+  /** Maximum age of the last sample before it is considered stale. Must be > 0. */
+  maxStalenessSeconds: number;
+}
+
+/**
+ * A single indexer lag sample. `lagSeconds` is the observed gap between the
+ * chain head and the last processed block; `observedAtMs` is the wall-clock
+ * time the sample was taken. Neither field may carry secrets or addresses.
+ */
+export interface IndexerLagSample {
+  lagSeconds: number;
+  observedAtMs: number;
+}
+
+/**
+ * Result of evaluating the indexer lag SLO. `withinSlo` is true only when a
+ * fresh sample exists and its lag is at or below the target. `code` is set on
+ * any non-ok outcome so callers and dashboards can branch on stable strings.
+ */
+export interface IndexerLagSloResult {
+  withinSlo: boolean;
+  code?: IndexerLagErrorCode;
+  correlationId: string;
+  /** Observed lag in seconds, or null when no fresh sample is available. */
+  lagSeconds: number | null;
+  targetLagSeconds: number;
+}
+
+/**
+ * Evaluates the indexer lag SLO fail-closed (#1178): a missing, stale, or
+ * non-finite sample is treated as a breach (INDEXER_LAG_UNAVAILABLE) rather
+ * than silently passing, and a lag above the target yields
+ * INDEXER_LAG_SLO_BREACH. Never surfaces raw error objects or connection
+ * details. Emits an actionable warn log on breach so the SLO is observable.
+ */
+export function evaluateIndexerLagSlo(
+  sample: IndexerLagSample | null | undefined,
+  slo: IndexerLagSlo,
+  correlationId: string,
+  now: () => number = Date.now,
+  logger?: ProbeLogger,
+): IndexerLagSloResult {
+  const base = {
+    correlationId,
+    targetLagSeconds: slo.targetLagSeconds,
+  };
+
+  const fresh =
+    sample != null &&
+    Number.isFinite(sample.lagSeconds) &&
+    Number.isFinite(sample.observedAtMs) &&
+    now() - sample.observedAtMs <= slo.maxStalenessSeconds * 1000;
+
+  if (!fresh) {
+    const result: IndexerLagSloResult = {
+      ...base,
+      withinSlo: false,
+      code: "INDEXER_LAG_UNAVAILABLE",
+      lagSeconds: null,
+    };
+    logger?.warn(
+      { correlationId, code: result.code, targetLagSeconds: slo.targetLagSeconds },
+      "indexer lag SLO unmeasurable",
+    );
+    return result;
+  }
+
+  const lagSeconds = sample.lagSeconds;
+  const withinSlo = lagSeconds <= slo.targetLagSeconds;
+  const result: IndexerLagSloResult = {
+    ...base,
+    withinSlo,
+    lagSeconds,
+  };
+  if (!withinSlo) {
+    result.code = "INDEXER_LAG_SLO_BREACH";
+    logger?.warn(
+      {
+        correlationId,
+        code: result.code,
+        lagSeconds,
+        targetLagSeconds: slo.targetLagSeconds,
+      },
+      "indexer lag SLO breached",
+    );
+  }
   return result;
 }
 
