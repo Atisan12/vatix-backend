@@ -135,7 +135,6 @@ function enforceRateLimit(request: FastifyRequest, reply: { status: (code: numbe
   bucket.count += 1;
   return true;
 }
-
 /**
  * BODY_LIMIT_POLICY.md: external HTTP entrypoints enforce a configurable
  * maximum request body size. Oversized bodies are rejected fail-closed with
@@ -183,6 +182,24 @@ function enforceBodyLimit(
   }
   return true;
 }
+
+
+export async function ordersRoutes(fastify: FastifyInstance) {
+  const prisma = getPrismaClient();
+
+  // Enforce the body-size policy at the plugin boundary so every route in this
+  // surface (including future privileged ones) is covered deny-by-default.
+  fastify.addHook("onRequest", async (request, reply) => {
+    if (!enforceBodyLimit(request, reply)) {
+      return reply;
+    }
+  });
+
+  fastify.get<{ Querystring: GetOrdersQuery }>(
+    "/orders",
+    {
+      schema: {
+        querystring:
 
 export async function ordersRoutes(fastify: FastifyInstance) {
   const prisma = getPrismaClient();
@@ -324,6 +341,93 @@ export async function ordersRoutes(fastify: FastifyInstance) {
         // Idempotency: replay of the same key returns the existing order
         // instead of creating a duplicate.
         if (body.idempotencyKey) {
-          const existing = await prisma.o
+          const existing = await prisma.order.findFirst({
+            where: { idempotencyKey: body.idempotencyKey, userId: auth.actor },
+          });
+          if (existing) {
+            return reply.status(200).send({ order: existing, correlationId: correlation });
+          }
+        }
 
-/* … truncated 3462 chars — edit only what you need near the top … */
+        const order = await prisma.order.create({
+          data: {
+            marketId: body.marketId,
+            side: body.side,
+            type: body.type,
+            price: body.price ?? null,
+            amount: body.amount,
+            status: "OPEN" as OrderStatus,
+            userId: auth.actor,
+            idempotencyKey: body.idempotencyKey ?? null,
+          },
+        });
+
+        reply.status(201).send({ order, correlationId: correlation });
+      } catch {
+        return fail(reply, 503, ERR.UNAVAILABLE, "Orders store unavailable", correlation);
+      }
+    }
+  );
+
+  fastify.post<{ Params: CancelOrderParams; Body: CancelOrderBody }>(
+    "/orders/:id/cancel",
+    {
+      schema: {
+        params: {
+          type: "object",
+          required: ["id"],
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 128 },
+          },
+        },
+        body: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
+          },
+        },
+      },
+    },
+    async (request: FastifyRequest<{ Params: CancelOrderParams; Body: CancelOrderBody }>, reply) => {
+      const correlation = correlationId(request);
+
+      const auth = authorizeWrite(request);
+      if (!auth.ok) {
+        return fail(reply, auth.status, auth.code, auth.message, correlation);
+      }
+
+      if (!(await dependencyHealthy(prisma))) {
+        return fail(reply, 503, ERR.UNAVAILABLE, "Orders store unavailable", correlation);
+      }
+
+      const { id } = request.params;
+
+      try {
+        const order = await prisma.order.findUnique({ where: { id } });
+        if (!order) {
+          return fail(reply, 404, ERR.NOT_FOUND, "Order not found", correlation);
+        }
+
+        // Deny-by-default: only the owner or an admin may cancel an order.
+        const user = (request as any).user;
+        if (order.userId !== auth.actor && user?.role !== "ADMIN") {
+          return fail(reply, 403, ERR.FORBIDDEN, "Not authorized to cancel this order", correlation);
+        }
+
+        if (order.status === "CANCELLED") {
+          return reply.status(200).send({ order, correlationId: correlation });
+        }
+
+        const cancelled = await prisma.order.update({
+          where: { id },
+          data: { status: "CANCELLED" as OrderStatus },
+        });
+
+        reply.status(200).send({ order: cancelled, correlationId: correlation });
+      } catch {
+        return fail(reply, 503, ERR.UNAVAILABLE, "Orders store unavailable", correlation);
+      }
+    }
+  );
+}
