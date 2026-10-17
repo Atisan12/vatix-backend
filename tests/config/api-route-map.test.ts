@@ -94,4 +94,18 @@ describe("API README route map", () => {
       expect(existsSync(target), link).toBe(true);
     }
   });
+
+  it("declares legacy aliases as structured, non-packed paths", () => {
+    for (const { method, path, legacyAliases } of CANONICAL_V1_ROUTES) {
+      if (!legacyAliases) continue;
+      expect(Array.isArray(legacyAliases), `${method} ${path}`).toBe(true);
+      for (const alias of legacyAliases) {
+        expect(alias, `${method} ${path}`).not.toContain(",");
+        expect(alias.trim(), `${method} ${path}`).toBe(alias);
+        expect(alias.startsWith("/"), `${method} ${path}: ${alias}`).toBe(
+          true
+        );
+      }
+    }
+  });
 });

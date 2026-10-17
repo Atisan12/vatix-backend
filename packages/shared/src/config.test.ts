@@ -297,4 +297,61 @@ describe("ConfigValidationError", () => {
       expect((err as ConfigValidationError).statusCode).toBe(400);
     }
   });
+
+  it("populates ENV_MISSING code and variable for a missing required var", () => {
+    const env = { ...BASE_ENV, DATABASE_URL: undefined };
+    try {
+      loadBaseConfig(env);
+      throw new Error("expected to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigValidationError);
+      expect((err as ConfigValidationError).code).toBe(
+        CONFIG_ERROR_CODES.ENV_MISSING
+      );
+      expect((err as ConfigValidationError).variable).toBe("DATABASE_URL");
+    }
+  });
+
+  it("populates ENV_MISSING code and variable for an empty required var", () => {
+    const env = { ...BASE_ENV, REDIS_URL: "" };
+    try {
+      loadBaseConfig(env);
+      throw new Error("expected to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigValidationError);
+      expect((err as ConfigValidationError).code).toBe(
+        CONFIG_ERROR_CODES.ENV_MISSING
+      );
+      expect((err as ConfigValidationError).variable).toBe("REDIS_URL");
+    }
+  });
+
+  it("populates ENV_INVALID code and variable for a malformed positive int", () => {
+    const env = { ...BASE_ENV, PORT: "abc" };
+    try {
+      loadBaseConfig(env);
+      throw new Error("expected to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigValidationError);
+      expect((err as ConfigValidationError).code).toBe(
+        CONFIG_ERROR_CODES.ENV_INVALID
+      );
+      expect((err as ConfigValidationError).variable).toBe("PORT");
+    }
+  });
+
+  it("populates ENV_INVALID code and variable for a malformed non-negative number", () => {
+    const env = { ...BASE_ENV, PORT: "-1" };
+    try {
+      loadBaseConfig(env);
+      throw new Error("expected to throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigValidationError);
+      expect((err as ConfigValidationError).code).toBe(
+        CONFIG_ERROR_CODES.ENV_INVALID
+      );
+      expect((err as ConfigValidationError).variable).toBe("PORT");
+    }
+  });
+
 });

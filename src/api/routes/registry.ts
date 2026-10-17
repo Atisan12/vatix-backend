@@ -5,35 +5,35 @@
 export interface CanonicalRoute {
   method: "GET" | "POST" | "PATCH" | "DELETE";
   path: string;
-  legacyAlias?: string;
+  legacyAliases?: string[];
   notes?: string;
 }
 
 export const CANONICAL_V1_ROUTES: CanonicalRoute[] = [
-  { method: "GET", path: "/v1/health", legacyAlias: "/health" },
+  { method: "GET", path: "/v1/health", legacyAliases: ["/health"] },
   {
     method: "GET",
     path: "/v1/ready",
-    legacyAlias: "/ready, /readiness",
+    legacyAliases: ["/ready", "/readiness"],
   },
-  { method: "GET", path: "/v1/markets", legacyAlias: "/markets" },
-  { method: "GET", path: "/v1/markets/:id", legacyAlias: "/markets/:id" },
+  { method: "GET", path: "/v1/markets", legacyAliases: ["/markets"] },
+  { method: "GET", path: "/v1/markets/:id", legacyAliases: ["/markets/:id"] },
   {
     method: "GET",
     path: "/v1/markets/:id/orderbook",
-    legacyAlias: "/markets/:id/orderbook",
+    legacyAliases: ["/markets/:id/orderbook"],
   },
-  { method: "POST", path: "/v1/orders", legacyAlias: "/orders" },
+  { method: "POST", path: "/v1/orders", legacyAliases: ["/orders"] },
   {
     method: "DELETE",
     path: "/v1/orders/:id",
-    legacyAlias: "/orders/:id",
+    legacyAliases: ["/orders/:id"],
     notes: "Cancel an open order",
   },
   {
     method: "GET",
     path: "/v1/orders/user/:address",
-    legacyAlias: "/orders/user/:address",
+    legacyAliases: ["/orders/user/:address"],
   },
   {
     method: "GET",
@@ -43,12 +43,12 @@ export const CANONICAL_V1_ROUTES: CanonicalRoute[] = [
   {
     method: "GET",
     path: "/v1/trades/user/:address",
-    legacyAlias: "/trades/user/:address",
+    legacyAliases: ["/trades/user/:address"],
   },
   {
     method: "GET",
     path: "/v1/wallets/:wallet/positions",
-    legacyAlias: "/positions/user/:address",
+    legacyAliases: ["/positions/user/:address"],
     notes: "Canonical wallet positions path",
   },
   {
@@ -64,13 +64,13 @@ export const CANONICAL_V1_ROUTES: CanonicalRoute[] = [
   {
     method: "GET",
     path: "/v1/admin/markets",
-    legacyAlias: "/admin/markets",
+    legacyAliases: ["/admin/markets"],
     notes: "Requires API key and admin auth",
   },
   {
     method: "PATCH",
     path: "/v1/admin/markets/:id/status",
-    legacyAlias: "/admin/markets/:id/status",
+    legacyAliases: ["/admin/markets/:id/status"],
     notes: "Requires API key and admin auth",
   },
   {
