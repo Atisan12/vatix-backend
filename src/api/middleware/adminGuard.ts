@@ -6,7 +6,16 @@ import { config } from "../../config.js";
 import { createLogger } from "../../../apps/indexer/src/logger.js";
 
 const Roles = { ADMIN: "admin" } as const;
-const logger = createLogger(process.env.LOG_LEVEL as any);
+const logger = createLogger(config.logLevel);
+
+let identityServiceInstance: AdminIdentityService | null = null;
+
+function getIdentityService(): AdminIdentityService {
+  if (!identityServiceInstance) {
+    identityServiceInstance = new AdminIdentityService(getPrismaClient());
+  }
+  return identityServiceInstance;
+}
 
 export async function requireAdmin(
   request: FastifyRequest,
@@ -24,12 +33,25 @@ export async function requireAdmin(
     (request.headers["x-request-id"] as string) || "unknown";
 
   try {
-    const prisma = getPrismaClient();
-    const identityService = new AdminIdentityService(prisma);
+    // Extract identity name from credential format before touching the store:
+    // Format: "identity_name:credential" (e.g., "alice:secret123")
+    const [identityName, ...credentialParts] = credential.split(":");
+    const credentialValue = credentialParts.join(":");
+
+    if (!identityName || !credentialValue) {
+      logger.info(
+        { requestId },
+        "Admin auth attempt with invalid credential format"
+      );
+      forbidden(reply, `Role '${Roles.ADMIN}' required`);
+      return;
+    }
+
+    const identityService = getIdentityService();
 
     // In production, the identity store must be configured and reachable.
     // Fail fast rather than silently allowing access.
-    const hasIdentities = await prisma.adminIdentity.findFirst({
+    const hasIdentities = await getPrismaClient().adminIdentity.findFirst({
       where: { active: true },
     });
 
@@ -40,20 +62,6 @@ export async function requireAdmin(
       logger.error(
         { requestId },
         "Admin identity store not configured in production"
-      );
-      forbidden(reply, `Role '${Roles.ADMIN}' required`);
-      return;
-    }
-
-    // Try identity-based auth first. Extract identity name from credential format:
-    // Format: "identity_name:credential" (e.g., "alice:secret123")
-    const [identityName, ...credentialParts] = credential.split(":");
-    const credentialValue = credentialParts.join(":");
-
-    if (!identityName || !credentialValue) {
-      logger.info(
-        { requestId },
-        "Admin auth attempt with invalid credential format"
       );
       forbidden(reply, `Role '${Roles.ADMIN}' required`);
       return;
@@ -85,4 +93,3 @@ export async function requireAdmin(
     return;
   }
 }
-

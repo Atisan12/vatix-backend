@@ -26,6 +26,7 @@ describe("requireAdmin guard", () => {
     await prisma.adminIdentityAuditLog.deleteMany({});
     await prisma.adminIdentity.deleteMany({});
     vi.unstubAllEnvs();
+    vi.restoreAllMocks();
   });
 
   it("returns 401 when no Authorization header", async () => {
@@ -54,6 +55,17 @@ describe("requireAdmin guard", () => {
     });
     expect(res.statusCode).toBe(403);
     expect(JSON.parse(res.body).code).toBe("FORBIDDEN");
+  });
+
+  it("does not query the identity store for a malformed credential", async () => {
+    const findFirstSpy = vi.spyOn(prisma.adminIdentity, "findFirst");
+    const res = await server.inject({
+      method: "GET",
+      url: "/admin/test",
+      headers: { authorization: "Bearer invalid-format" },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(findFirstSpy).not.toHaveBeenCalled();
   });
 
   it("allows request with valid identity and credential", async () => {
