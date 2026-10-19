@@ -157,7 +157,43 @@ describe("FillsResumeService", () => {
       expect(result.reason).toBe("cursor_trimmed");
     });
 
-    it("should report beyond_max_window when cursor is older than the replay window even if Postgres has rows", async () => {
+      const result = await fillsResumeService.detectGap("1234567890-0");
+
+      expect(result.hasGap).toBe(true);
+      expect(result.reason).toBe("cursor_unknown");
+      expect(result.suggestedCursor).toBeUndefined();
+    });
+
+    it("fails closed when the latest bounds read rejects", async () => {
+      vi.mocked(redis.xrange).mockResolvedVal
+        }
+        return [];
+      });
+      vi.mocked(redis.xrevrange).mockResolvedValue([
+        ["1234567999-0", ["data"]],
+      ]);
+
+      const result = await fillsResumeService.detectGap("1234567890-0");
+
+      expect(result.hasGap).toBe(true);
+      expect(result.reason).toBe("cursor_unknown");
+      expect(result.suggestedCursor).toBeUndefined();
+    });
+
+    it("fails closed when the latest bounds read rejects", async () => {
+      vi.mocked(redis.xrange).mockResolvedValue([]);
+      vi.mocked(redis.xrevrange).mockRejectedValue(
+        new Error("redis unavailable")
+      );
+
+      const result = await fillsResumeService.detectGap("1234567890-0");
+
+      expect(result.hasGap).toBe(true);
+      expect(result.reason).toBe("cursor_unknown");
+      expect(result.suggestedCursor).toBeUndefined();
+    });
+
+    it("should report beyond_max_window when cursor is outside the replay window even if Postgres has rows", async () => {
       const oldCursor = `${Date.now() - 60 * 60 * 1000}-0`; // 1 hour old
 
       // Cursor absent from Redis

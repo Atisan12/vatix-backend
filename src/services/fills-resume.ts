@@ -1,5 +1,6 @@
 import { redis } from "./redis.js";
 import { getPrismaClient } from "./prisma.js";
+import { logger } from "../../../packages/shared/src/logger.js";
 
 /**
  * Fills SSE resume cursor: opaque string representing a point in the trade stream
@@ -41,6 +42,7 @@ export class FillsResumeService {
 
   /**
    * Get the earliest available cursor in the audit stream (oldest non-trimmed entry)
+   * Throws if Redis is unreachable so callers can fail closed.
    */
   async getOldestAvailableCursor(): Promise<FillsResumeCursor | null> {
     try {
@@ -53,13 +55,17 @@ export class FillsResumeService {
       );
       return entries.length > 0 ? (entries[0][0] as FillsResumeCursor) : null;
     } catch (error) {
-      console.error("Failed to get oldest available cursor:", error);
-      return null;
+      logger.error(
+        { code: (error as { code?: string })?.code },
+        "Failed to get oldest available cursor"
+      );
+      throw error;
     }
   }
 
   /**
    * Get the latest cursor in the audit stream (newest entry)
+   * Throws if Redis is unreachable so callers can fail closed.
    */
   async getLatestAvailableCursor(): Promise<FillsResumeCursor | null> {
     try {
@@ -72,8 +78,11 @@ export class FillsResumeService {
       );
       return entries.length > 0 ? (entries[0][0] as FillsResumeCursor) : null;
     } catch (error) {
-      console.error("Failed to get latest available cursor:", error);
-      return null;
+      logger.error(
+        { code: (error as { code?: string })?.code },
+        "Failed to get latest available cursor"
+      );
+      throw error;
     }
   }
 
@@ -126,7 +135,14 @@ export class FillsResumeService {
         }
 
         // Neither Redis nor Postgres has data for this cursor
-        const oldest = await this.getOldestAvailableCursor();
+        let oldest: FillsResumeCursor | null;
+        try {
+          oldest = await this.getOldestAvailableCursor();
+        } catch {
+          // Bounds read failed: fail closed rather than report no gap
+          return { hasGap: true, reason: "cursor_unknown" };
+        }
+
         const latestPostgres = await prisma.trade.findFirst({
           select: { tradedAt: true },
           orderBy: { tradedAt: "desc" },
@@ -166,7 +182,10 @@ export class FillsResumeService {
       // Cursor exists in Redis; no gap
       return { hasGap: false };
     } catch (error) {
-      console.error("Failed to detect gap:", error);
+      logger.error(
+        { code: (error as { code?: string })?.code },
+        "Failed to detect gap"
+      );
       // Fail open on errors: prefer reconnecting over 410 storms
       return { hasGap: false };
     }
