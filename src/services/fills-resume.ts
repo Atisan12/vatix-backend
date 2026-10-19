@@ -100,6 +100,17 @@ export class FillsResumeService {
         const cursorMs = this.extractTimestampMs(cursor);
         const cursorDate = new Date(cursorMs);
 
+        // Cursor older than the replay window: SSE cannot replay that far back,
+        // so the client must fall back to REST polling regardless of Postgres.
+        if (cursorMs < Date.now() - this.maxReplayWindowMs) {
+          const oldest = await this.getOldestAvailableCursor();
+          return {
+            hasGap: true,
+            reason: "beyond_max_window",
+            suggestedCursor: oldest ?? undefined,
+          };
+        }
+
         // Query Postgres to see if we have any trades at or after this cursor
         const oldestPostgresEntry = await prisma.trade.findFirst({
           where: {
@@ -277,38 +288,11 @@ export class FillsResumeService {
   }
 
   /**
-   * Extract millisecond timestamp from cursor (Redis stream ID format: ms-seq)
+   * Extract timestamp (ms) from a Redis stream ID cursor
    */
   private extractTimestampMs(cursor: FillsResumeCursor): number {
-    const [ms] = cursor.split("-");
-    const timestamp = parseInt(ms, 10);
-    return Number.isNaN(timestamp) ? 0 : timestamp;
-  }
-
-  /**
-   * Parse a resume cursor (which may be ISO timestamp for backwards compatibility)
-   */
-  parseCursor(raw: string | undefined): FillsResumeCursor | null {
-    if (!raw) return null;
-
-    // If it looks like a timestamp (numeric), use as-is
-    if (/^\d+$/.test(raw)) {
-      return raw as FillsResumeCursor;
-    }
-
-    // If it looks like stream ID format (ms-seq), use as-is
-    if (/^\d+-\d+$/.test(raw)) {
-      return raw as FillsResumeCursor;
-    }
-
-    // Try to parse as ISO date and convert to stream ID format
-    const parsed = new Date(raw);
-    if (!Number.isNaN(parsed.getTime())) {
-      return `${parsed.getTime()}-0` as FillsResumeCursor;
-    }
-
-    return null;
+    const [msPart] = cursor.split("-");
+    const ms = parseInt(msPart, 10);
+    return Number.isFinite(ms) ? ms : 0;
   }
 }
-
-export const fillsResumeService = new FillsResumeService();
