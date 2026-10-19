@@ -183,6 +183,63 @@ describe("replayEvents (golden corpus, replay equals live engine output)", () =>
     expect(replayResult.book.getOrdersAtPrice("ask", 0.5)).toHaveLength(0);
   });
 
+  it("removes a cancelled order from the replay book and zeroes its remaining", () => {
+    const makerTs = 1_700_000_000_000;
+    const cancelTs = 1_700_000_000_500;
+
+    const events: ReplayEvent[] = [
+      {
+        type: "create",
+        id: "maker-1",
+        userAddress: "GMAKER00000000000000000000000000000000000000000007",
+        side: "SELL",
+        price: 0.5,
+        quantity: 50,
+        timestamp: makerTs,
+      },
+      { type: "cancel", id: "maker-1", timestamp: cancelTs },
+    ];
+
+    const replayResult = replayEvents(marketId, outcome, events);
+
+    // The cancelled order must be gone from the replay book.
+    expect(replayResult.book.getOrderCount()).toBe(0);
+    expect(replayResult.book.getOrdersAtPrice("ask", 0.5)).toHaveLength(0);
+    // Its bookkeeping entry reflects the cancellation (remaining 0 or removed).
+    const cancelled = replayResult.orders.get("maker-1");
+    if (cancelled !== undefined) {
+      expect(cancelled.remaining).toBe(0);
+    } else {
+      expect(cancelled).toBeUndefined();
+    }
+  });
+
+  it("records a no-op for a cancel referencing an unknown order id", () => {
+    const makerTs = 1_700_000_000_000;
+    const cancelTs = 1_700_000_000_500;
+
+    const events: ReplayEvent[] = [
+      {
+        type: "create",
+        id: "maker-1",
+        userAddress: "GMAKER00000000000000000000000000000000000000000008",
+        side: "SELL",
+        price: 0.5,
+        quantity: 50,
+        timestamp: makerTs,
+      },
+      { type: "cancel", id: "ghost-order", timestamp: cancelTs },
+    ];
+
+    // Documented behaviour: an unknown-id cancel is a recorded no-op, not a
+    // silent swallow and not a crash. The known order is untouched.
+    const replayResult = replayEvents(marketId, outcome, events);
+
+    expect(replayResult.book.getOrderCount()).toBe(1);
+    expect(replayResult.orders.get("maker-1")?.remaining).toBe(50);
+    expect(replayResult.orders.has("ghost-order")).toBe(false);
+  });
+
   it("skips a self-trade and matches the next resting order at the same price", () => {
     const sameUser = "GSAMEUSER0000000000000000000000000000000000000001";
     const selfTs = 1_700_000_000_000;
