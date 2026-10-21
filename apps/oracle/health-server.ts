@@ -15,6 +15,7 @@
  */
 
 import fastify, { type FastifyInstance } from "fastify";
+import { isIP } from "node:net";
 import { healthRoutes, type HealthRoutesOptions } from "./routes/health.js";
 
 /** Default per-probe timeout for the standalone health server. */
@@ -25,12 +26,32 @@ export function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
+/** Whether a value is a syntactically valid IP address or DNS hostname. */
+function isValidBindHost(host: string): boolean {
+  if (isIP(host) !== 0) {
+    return true;
+  }
+
+  const hostname = host.endsWith(".") ? host.slice(0, -1) : host;
+  if (
+    hostname.length === 0 ||
+    hostname.length > 253 ||
+    /^\d+(?:\.\d+){3}$/.test(hostname)
+  ) {
+    return false;
+  }
+
+  return hostname.split(".").every((label) =>
+    /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)
+  );
+}
+
 /**
  * Resolve the health-server bind options from the environment, or `null` when
  * the feature is disabled (no `ORACLE_HEALTH_PORT`).
  *
  * @throws {Error} when the port is not a valid TCP port, or when production
- *   would bind a routable address without a token.
+ *   would bind a routable address without a token, or the host is invalid.
  */
 export function resolveHealthServerOptions(
   env: Record<string, string | undefined> = process.env
@@ -47,7 +68,14 @@ export function resolveHealthServerOptions(
     );
   }
 
-  const host = env.ORACLE_HEALTH_HOST?.trim() || "127.0.0.1";
+  const rawHost = env.ORACLE_HEALTH_HOST;
+  const host = rawHost === undefined ? "127.0.0.1" : rawHost.trim();
+  if (!host || !isValidBindHost(host)) {
+    throw new Error(
+      `ORACLE_HEALTH_HOST must be a valid IP address or hostname, got: ${JSON.stringify(rawHost)}`
+    );
+  }
+
   const requiredToken = env.ORACLE_HEALTH_TOKEN?.trim() || undefined;
 
   if (
@@ -96,7 +124,10 @@ export async function startHealthServer(
 
   const app = await buildHealthServer({
     ...options,
-    requiredToken: options.requiredToken ?? resolved.requiredToken,
+    requiredToken:
+      options.requiredToken !== undefined
+        ? options.requiredToken
+        : resolved.requiredToken,
   });
 
   await app.listen({ host: resolved.host, port: resolved.port });

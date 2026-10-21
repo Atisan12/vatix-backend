@@ -13,6 +13,10 @@ import {
   MAX_CHALLENGE_WINDOW_SECONDS,
   MAX_PROVIDER_TIMEOUT_MS,
 } from "./oracle-config.js";
+import {
+  MAX_POLL_INTERVAL_MS,
+  MIN_POLL_INTERVAL_MS,
+} from "./oracle-scheduler.js";
 
 const keypair = Keypair.random();
 const otherKeypair = Keypair.random();
@@ -39,7 +43,7 @@ describe("signing key validation (#1115)", () => {
   it("rejects a placeholder or malformed secret key", () => {
     expectConfigError(
       () => loadOracleConfig({ ORACLE_SECRET_KEY: "secret123" }),
-      ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_VALUE,
+      ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_SECRET,
       "ORACLE_SECRET_KEY"
     );
   });
@@ -48,9 +52,23 @@ describe("signing key validation (#1115)", () => {
     expectConfigError(
       () =>
         loadOracleConfig({ ORACLE_SECRET_KEY: keypair.secret().slice(0, 20) }),
-      ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_VALUE,
+      ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_SECRET,
       "ORACLE_SECRET_KEY"
     );
+  });
+
+  it("fails closed when a secret is required but missing or empty", () => {
+    for (const secretKey of [undefined, ""]) {
+      expectConfigError(
+        () =>
+          loadOracleConfig({
+            ORACLE_REQUIRE_SECRET_KEY: "true",
+            ...(secretKey === undefined ? {} : { ORACLE_SECRET_KEY: secretKey }),
+          }),
+        ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_MISSING_SECRET,
+        "ORACLE_SECRET_KEY"
+      );
+    }
   });
 
   it("derives the signer public key from the secret", () => {
@@ -119,6 +137,33 @@ describe("numeric bounds (#1115)", () => {
     );
   });
 
+  it("rejects non-positive challenge windows", () => {
+    for (const challengeWindowSeconds of ["0", "-1"]) {
+      expectConfigError(
+        () =>
+          loadOracleConfig({
+            ORACLE_CHALLENGE_WINDOW_SECONDS: challengeWindowSeconds,
+          }),
+        ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_VALUE,
+        "ORACLE_CHALLENGE_WINDOW_SECONDS"
+      );
+    }
+  });
+
+  it("rejects out-of-range polling intervals with a typed config error", () => {
+    for (const pollIntervalMs of [
+      "0",
+      String(MIN_POLL_INTERVAL_MS - 1),
+      String(MAX_POLL_INTERVAL_MS + 1),
+    ]) {
+      expectConfigError(
+        () => loadOracleConfig({ ORACLE_POLL_INTERVAL_MS: pollIntervalMs }),
+        ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_VALUE,
+        "ORACLE_POLL_INTERVAL_MS"
+      );
+    }
+  });
+
   it("rejects a provider timeout beyond the upper bound", () => {
     expectConfigError(
       () =>
@@ -141,10 +186,12 @@ describe("numeric bounds (#1115)", () => {
 
   it("keeps accepting in-range values", () => {
     const config = loadOracleConfig({
+      ORACLE_POLL_INTERVAL_MS: String(MIN_POLL_INTERVAL_MS),
       ORACLE_CHALLENGE_WINDOW_SECONDS: "3600",
       ORACLE_PRIMARY_TIMEOUT_MS: "1500",
       ORACLE_FALLBACK_TIMEOUT_MS: "2000",
     });
+    expect(config.pollIntervalMs).toBe(MIN_POLL_INTERVAL_MS);
     expect(config.challengeWindowSeconds).toBe(3600);
     expect(config.primaryTimeoutMs).toBe(1500);
     expect(config.fallbackTimeoutMs).toBe(2000);
@@ -152,12 +199,29 @@ describe("numeric bounds (#1115)", () => {
 });
 
 describe("describeOracleConfig (#1115)", () => {
-  it("redacts the secret key", () => {
+  it("omits secret material while exposing the derived public signer", () => {
     const config = loadOracleConfig({ ORACLE_SECRET_KEY: keypair.secret() });
     const summary = describeOracleConfig(config);
+    const serializedSummary = JSON.stringify(summary);
+    const secretKey = keypair.secret();
 
     expect(summary.secretKeyConfigured).toBe(true);
-    expect(JSON.stringify(summary)).not.toContain(keypair.secret());
+    expect(Object.keys(summary).sort()).toEqual(
+      [
+        "pollIntervalMs",
+        "challengeWindowSeconds",
+        "logLevel",
+        "primaryTimeoutMs",
+        "fallbackTimeoutMs",
+        "minConfidenceThreshold",
+        "secretKeyConfigured",
+        "signerPublicKey",
+        "trustedSignerPublicKey",
+      ].sort()
+    );
+    expect(serializedSummary).not.toContain(secretKey);
+    expect(serializedSummary).not.toContain(secretKey.slice(0, 8));
+    expect(serializedSummary).not.toContain(secretKey.slice(-8));
     expect(summary.signerPublicKey).toBe(keypair.publicKey());
   });
 

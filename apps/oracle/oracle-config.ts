@@ -8,8 +8,9 @@
  */
 
 import {
-  getOraclePollIntervalMs,
   DEFAULT_POLL_INTERVAL_MS,
+  MAX_POLL_INTERVAL_MS,
+  MIN_POLL_INTERVAL_MS,
 } from "./oracle-scheduler.js";
 import { DEFAULT_TIMEOUT_MS } from "./timeout-utils.js";
 import { Keypair } from "@stellar/stellar-sdk";
@@ -218,7 +219,14 @@ export function describeOracleConfig(
  */
 export function loadOracleConfig(env: Env = process.env): OracleConfig {
   const correlationId = newConfigCorrelationId();
-  const pollIntervalMs = getOraclePollIntervalMs();
+  const pollIntervalMs = parseBoundedInt(
+    env["ORACLE_POLL_INTERVAL_MS"],
+    "ORACLE_POLL_INTERVAL_MS",
+    DEFAULT_POLL_INTERVAL_MS,
+    MAX_POLL_INTERVAL_MS,
+    correlationId,
+    MIN_POLL_INTERVAL_MS
+  );
 
   const challengeWindowSeconds = parseBoundedInt(
     env["ORACLE_CHALLENGE_WINDOW_SECONDS"],
@@ -395,17 +403,18 @@ function parseBoundedInt(
   variable: string,
   defaultValue: number,
   max: number,
-  correlationId: string
+  correlationId: string,
+  min = 1
 ): number {
   if (raw === undefined || raw === "") {
     return defaultValue;
   }
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > max) {
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
     throw new OracleConfigError(
       ORACLE_CONFIG_ERROR_CODES.ORACLE_CONFIG_INVALID_VALUE,
       variable,
-      `${variable} must be an integer in (0, ${max}]`,
+      `${variable} must be an integer between ${min} and ${max}`,
       correlationId
     );
   }
