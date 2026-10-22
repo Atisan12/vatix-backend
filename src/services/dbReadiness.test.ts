@@ -2,9 +2,10 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { checkDbReadiness } from "./dbReadiness.js";
 
 const mockQueryRaw = vi.fn();
+const mockGetPrismaClient = vi.fn(() => ({ $queryRaw: mockQueryRaw }));
 
 vi.mock("./prisma.js", () => ({
-  getPrismaClient: () => ({ $queryRaw: mockQueryRaw }),
+  getPrismaClient: () => mockGetPrismaClient(),
 }));
 
 describe("checkDbReadiness", () => {
@@ -26,7 +27,7 @@ describe("checkDbReadiness", () => {
   it("rejects with DEPENDENCY_TIMEOUT when the query does not settle within the deadline", async () => {
     mockQueryRaw.mockReturnValueOnce(new Promise(() => {}));
     const start = Date.now();
-    await expect(checkDbReadiness(50)).rejects.toMatchObject({
+    await expect(checkDbReadiness({ timeoutMs: 50 })).rejects.toMatchObject({
       code: "DEPENDENCY_TIMEOUT",
     });
     expect(Date.now() - start).toBeLessThan(1000);
@@ -46,5 +47,34 @@ describe("checkDbReadiness", () => {
       expect(error.message).not.toContain("db.internal");
       expect(error.cause).toBe(sensitiveError);
     }
+  });
+
+  describe("with an injected client", () => {
+    it("resolves when the injected client query resolves", async () => {
+      const queryRaw = vi.fn().mockResolvedValueOnce([{ "?column?": 1 }]);
+      await expect(
+        checkDbReadiness({ client: { $queryRaw: queryRaw } }),
+      ).resolves.toBeUndefined();
+      expect(queryRaw).toHaveBeenCalledOnce();
+      expect(mockGetPrismaClient).not.toHaveBeenCalled();
+    });
+
+    it("rejects with DEPENDENCY_UNAVAILABLE when the injected client rejects", async () => {
+      const queryRaw = vi.fn().mockRejectedValueOnce(new Error("connection refused"));
+      await expect(
+        checkDbReadiness({ client: { $queryRaw: queryRaw } }),
+      ).rejects.toMatchObject({ code: "DEPENDENCY_UNAVAILABLE" });
+      expect(mockGetPrismaClient).not.toHaveBeenCalled();
+    });
+
+    it("rejects with DEPENDENCY_TIMEOUT when the injected client never settles", async () => {
+      const queryRaw = vi.fn().mockReturnValueOnce(new Promise(() => {}));
+      const start = Date.now();
+      await expect(
+        checkDbReadiness({ client: { $queryRaw: queryRaw }, timeoutMs: 50 }),
+      ).rejects.toMatchObject({ code: "DEPENDENCY_TIMEOUT" });
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(mockGetPrismaClient).not.toHaveBeenCalled();
+    });
   });
 });

@@ -1,10 +1,16 @@
 import { getPrismaClient } from "../lib/prisma";
+import type { PrismaClient } from "@prisma/client";
 
 export type DbReadinessErrorCode = "DEPENDENCY_TIMEOUT" | "DEPENDENCY_UNAVAILABLE";
 
 export interface DbReadinessError extends Error {
   code: DbReadinessErrorCode;
   cause?: unknown;
+}
+
+export interface DbReadinessOptions {
+  client?: Pick<PrismaClient, "$queryRaw">;
+  timeoutMs?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 2000;
@@ -26,9 +32,13 @@ function makeError(code: DbReadinessErrorCode, cause?: unknown): DbReadinessErro
  * `DEPENDENCY_TIMEOUT` when the deadline is exceeded, `DEPENDENCY_UNAVAILABLE`
  * when the query fails for any other reason. The message contains only the
  * dependency name and code — never connection strings, hosts, or driver detail.
+ *
+ * The Prisma client is resolved lazily so callers and tests can inject a fake
+ * via `options.client` without touching the Prisma singleton.
  */
-export async function checkDbReadiness(timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<void> {
-  const prisma = getPrismaClient();
+export async function checkDbReadiness(options?: DbReadinessOptions): Promise<void> {
+  const prisma = options?.client ?? getPrismaClient();
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
